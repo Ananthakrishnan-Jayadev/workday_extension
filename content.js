@@ -124,11 +124,42 @@
   }
 
   function getAddButtonForSection(sectionName) {
-    for (const h of document.querySelectorAll('h3')) {
-      if (h.textContent.trim().includes(sectionName)) {
-        const section = h.closest('[role="group"]');
-        if (section) { const btn = section.querySelector('[data-automation-id="add-button"]'); if (btn) return btn; }
+    const target = sectionName.trim().toLowerCase();
+
+    // Strategy 1: locate any heading containing the section name, then find the nearest Add button.
+    const headings = document.querySelectorAll('h2, h3, h4, h5, [role="heading"]');
+    for (const h of headings) {
+      if (!h.textContent.trim().toLowerCase().includes(target)) continue;
+      const section = h.closest('[role="group"], [role="region"], fieldset, section, div[data-automation-id]') || h.parentElement;
+      if (!section) continue;
+      const btn = findAddButton(section);
+      if (btn) return btn;
+    }
+
+    // Strategy 2: global search for any button whose label/text starts with "Add <sectionName>".
+    const allButtons = document.querySelectorAll('button');
+    for (const b of allButtons) {
+      const label = ((b.getAttribute('aria-label') || '') + ' ' + (b.textContent || '')).trim().toLowerCase();
+      if (label.startsWith('add ' + target) || label === 'add ' + target) return b;
+      if (label.includes('add another') && b.closest('[data-automation-id]')) {
+        const container = b.closest('[data-automation-id]');
+        const heading = container.querySelector('h2, h3, h4, h5, [role="heading"]');
+        if (heading && heading.textContent.trim().toLowerCase().includes(target)) return b;
       }
+    }
+
+    return null;
+  }
+
+  function findAddButton(scope) {
+    const candidates = scope.querySelectorAll('button, [role="button"]');
+    for (const b of candidates) {
+      const aid = (b.getAttribute('data-automation-id') || '').toLowerCase();
+      if (aid === 'add-button' || aid === 'add' || aid === 'addbutton' || aid.startsWith('add')) return b;
+    }
+    for (const b of candidates) {
+      const label = ((b.getAttribute('aria-label') || '') + ' ' + (b.textContent || '')).trim().toLowerCase();
+      if (label === 'add' || label.startsWith('add ') || label.includes('add another')) return b;
     }
     return null;
   }
@@ -136,6 +167,15 @@
   function getLastField(id) {
     const all = document.querySelectorAll(`[data-automation-id="${id}"]`);
     return all[all.length - 1] || null;
+  }
+
+  // Try a list of automation-ids and return the last element from the first one that matches.
+  function getLastFieldAny(ids) {
+    for (const id of ids) {
+      const el = getLastField(id);
+      if (el) return el;
+    }
+    return null;
   }
 
   async function fillPage1(data) {
@@ -207,50 +247,134 @@
       await wait(400);
     }
 
-    // Education — click Add for EVERY entry + pressEnterTwice after each field
+    // Education — pause 2s, then for each entry: school → degree → field of study → gpa → years
+    await wait(2000);
     for (let i = 0; i < (data.education || []).length; i++) {
       const entry = data.education[i];
       const addBtn = getAddButtonForSection('Education');
       if (!addBtn) { console.warn(`[Workday Autofill] No Education Add button for entry ${i}`); continue; }
       addBtn.click(); await wait(900);
 
-      // School
-      const schoolEl = getLastField('formField-school');
-      if (schoolEl) {
-        const input = schoolEl.querySelector('[data-automation-id="searchBox"]') || schoolEl.querySelector('input');
-        if (input) {
-          input.focus(); input.click(); setInputValue(input, entry.school); await wait(700);
-          const results = document.querySelectorAll('[role="listbox"] [role="option"], [data-automation-id="promptOption"]');
-          for (const r of results) { if (r.textContent.toLowerCase().includes(entry.school.toLowerCase())) { r.click(); await wait(300); break; } }
-          await pressEnterTwice(input); await wait(300);
+      // 1. School / University — plain text input on this tenant; set value directly.
+      if (entry.school) {
+        const schoolEl = getLastFieldAny(['formField-schoolName', 'formField-school', 'formField-university', 'formField-institution']);
+        if (schoolEl) {
+          // Pick the visible named input, not any decorative sibling.
+          const input = schoolEl.querySelector('input[name="schoolName"]')
+                     || schoolEl.querySelector('input[type="text"]:not(.css-77hcv)')
+                     || schoolEl.querySelector('[data-automation-id="searchBox"]')
+                     || schoolEl.querySelector('input');
+          if (input) {
+            input.focus(); input.click();
+            setInputValue(input, entry.school);
+            await wait(500);
+            // If a typeahead listbox happened to open, accept the first match; otherwise just blur.
+            const results = document.querySelectorAll('[role="listbox"] [role="option"], [data-automation-id="promptOption"]');
+            for (const r of results) {
+              if (r.closest('[data-automation-id="selectedItemList"]')) continue;
+              if (r.textContent.toLowerCase().includes(entry.school.toLowerCase())) { r.click(); await wait(300); break; }
+            }
+            input.blur();
+            await wait(300);
+          }
         }
       }
 
-      // Degree
-      const degreeEl = getLastField('formField-degree');
-      if (degreeEl) {
-        const degInput = degreeEl.querySelector('[data-automation-id="searchBox"]') || degreeEl.querySelector('input');
-        const degBtn = degreeEl.querySelector('button[aria-haspopup="listbox"]');
-        if (degInput) {
-          degInput.focus(); degInput.click(); setInputValue(degInput, entry.degree); await wait(800);
-          pressEnter(degInput); await wait(500);
-        } else if (degBtn) {
-          degBtn.click(); await wait(500);
-          const opts = document.querySelectorAll('[role="option"]');
-          for (const opt of opts) { if (opt.textContent.trim().toLowerCase().includes(entry.degree.trim().toLowerCase())) { opt.click(); await wait(300); break; } }
+      // 2. Degree — button-dropdown (aria-haspopup="listbox"). Click button, then pick option.
+      if (entry.degree) {
+        const degreeEl = getLastFieldAny(['formField-degree', 'formField-degreeLevel', 'formField-degreeName']);
+        if (degreeEl) {
+          const degBtn = degreeEl.querySelector('button[aria-haspopup="listbox"]');
+          if (degBtn) {
+            degBtn.click();
+            await wait(700);
+            const opts = document.querySelectorAll('[role="option"], [role="listbox"] li');
+            const target = entry.degree.trim().toLowerCase();
+            let picked = false;
+            for (const o of opts) {
+              if (o.textContent.trim().toLowerCase() === target) { o.click(); picked = true; await wait(400); break; }
+            }
+            if (!picked) {
+              for (const o of opts) {
+                if (o.textContent.trim().toLowerCase().includes(target)) { o.click(); picked = true; await wait(400); break; }
+              }
+            }
+            if (!picked) {
+              // Close the popup so subsequent fields are reachable.
+              document.body.click();
+              await wait(200);
+              console.warn('[Workday Autofill] Degree option not found:', entry.degree);
+            }
+          } else {
+            // Fallback: typeahead-style input if the tenant ever uses one.
+            const degInput = degreeEl.querySelector('[data-automation-id="searchBox"]') || degreeEl.querySelector('input:not(.css-77hcv)');
+            if (degInput) {
+              degInput.focus(); degInput.click(); setInputValue(degInput, entry.degree); await wait(800);
+              await pressEnterTwice(degInput); await wait(400);
+            }
+          }
         }
       }
 
-      // Field of Study
-      const fosEl = getLastField('formField-fieldOfStudy');
-      if (fosEl) {
-        const input = fosEl.querySelector('[data-automation-id="searchBox"]') || fosEl.querySelector('input');
-        if (input) {
-          input.focus(); input.click(); setInputValue(input, entry.fieldOfStudy); await wait(800);
-          pressEnter(input); await wait(500);
+      // 3. Field of Study — multi-select with placeholder="Search". Type, then click matching option.
+      if (entry.fieldOfStudy) {
+        const fosEl = getLastFieldAny(['formField-fieldOfStudy', 'formField-major', 'formField-fieldofstudy']);
+        if (fosEl) {
+          const input = fosEl.querySelector('[data-automation-id="multiselectInputContainer"] input')
+                     || fosEl.querySelector('input[placeholder="Search"]')
+                     || fosEl.querySelector('[data-automation-id="searchBox"]')
+                     || fosEl.querySelector('input');
+          if (input) {
+            input.focus(); input.click();
+            setInputValue(input, entry.fieldOfStudy);
+            await wait(900);
+            const target = entry.fieldOfStudy.trim().toLowerCase();
+            // Exclude already-selected pills (which also use [data-automation-id="promptOption"]).
+            const results = [...document.querySelectorAll('[role="option"], [data-automation-id="promptOption"]')]
+              .filter(r => !r.closest('[data-automation-id="selectedItemList"]')
+                        && !r.closest('[data-automation-id="selectedItem"]'));
+            let picked = false;
+            for (const r of results) {
+              if (r.textContent.trim().toLowerCase() === target) { r.click(); picked = true; await wait(400); break; }
+            }
+            if (!picked) {
+              for (const r of results) {
+                if (r.textContent.toLowerCase().includes(target)) { r.click(); picked = true; await wait(400); break; }
+              }
+            }
+            if (!picked) { pressEnter(input); await wait(300); }
+            input.blur();
+            await wait(300);
+          }
         }
       }
-      await wait(400);
+
+      // 4. GPA / Overall Result — plain text input
+      if (entry.gpa) {
+        const gpaEl = getLastField('formField-gradeAverage') || getLastField('formField-overallResult') || getLastField('formField-gpa');
+        if (gpaEl) {
+          const input = gpaEl.querySelector('input');
+          if (input) { setInputValue(input, entry.gpa); await wait(200); }
+        }
+      }
+
+      // 5. Years — start (firstYearAttended) and end (lastYearAttended)
+      if (entry.startYear) {
+        const fyEl = getLastField('formField-firstYearAttended') || getLastField('formField-startYear');
+        if (fyEl) {
+          const input = fyEl.querySelector('input');
+          if (input) { setInputValue(input, entry.startYear); await wait(200); }
+        }
+      }
+      if (entry.endYear) {
+        const lyEl = getLastField('formField-lastYearAttended') || getLastField('formField-endYear');
+        if (lyEl) {
+          const input = lyEl.querySelector('input');
+          if (input) { setInputValue(input, entry.endYear); await wait(200); }
+        }
+      }
+
+      await wait(500);
     }
 
     // Certifications

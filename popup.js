@@ -10,4 +10,8 @@ document.addEventListener('DOMContentLoaded', function() {
         statusDiv.textContent = "Not a Workday page";
       }
     });
+
+    document.getElementById('openOptions').addEventListener('click', function() {
+      chrome.runtime.openOptionsPage();
+    });
   });

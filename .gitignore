@@ -32,6 +32,7 @@ data.json
 *.crx
 *.pem
 *.zip
+*.xpi
 
 # Test and coverage output
 coverage/

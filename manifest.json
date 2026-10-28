@@ -1,0 +1,35 @@
+{
+  "manifest_version": 3,
+  "name": "Workday Autofill",
+  "version": "1.1",
+  "permissions": [
+    "activeTab",
+    "storage"
+  ],
+  "content_scripts": [
+    {
+      "matches": ["*://*.myworkdayjobs.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  },
+  "web_accessible_resources": [
+    {
+      "resources": ["data.json"],
+      "matches": ["*://*.myworkdayjobs.com/*"]
+    }
+  ],
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "workday-autofill@example.local",
+      "strict_min_version": "109.0"
+    }
+  }
+}

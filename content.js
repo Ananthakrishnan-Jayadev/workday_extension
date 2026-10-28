@@ -1,13 +1,20 @@
 (async function () {
-  // Step A — Load data.json
-  const dataUrl = chrome.runtime.getURL('data.json');
-  let data = {};
+  // Step A — Load profile from extension storage (set via the options page), falling back to bundled data.json
+  let data = null;
   try {
-    const response = await fetch(dataUrl);
-    data = await response.json();
+    const stored = await chrome.storage.local.get('profile');
+    data = stored.profile || null;
   } catch (e) {
-    console.error("[Workday Autofill] Error loading data.json", e);
-    return;
+    console.warn("[Workday Autofill] Could not read saved profile", e);
+  }
+  if (!data) {
+    try {
+      const response = await fetch(chrome.runtime.getURL('data.json'));
+      data = await response.json();
+    } catch (e) {
+      console.error("[Workday Autofill] No profile found. Save one on the extension's options page.", e);
+      return;
+    }
   }
 
   function setInputValue(input, value) {
@@ -109,18 +116,114 @@
   await wait(500);
 }
 
+  // Accept either a single value or an ordered list of fallbacks.
+  function toList(value) {
+    if (Array.isArray(value)) return value.filter(Boolean);
+    return value ? [value] : [];
+  }
+
+  // Lowercase and ignore apostrophes, dashes, slashes and extra spaces when comparing labels.
+  function normalizeText(s) {
+    return (s || '').toLowerCase().replace(/[’']/g, '').replace(/[-–—/]/g, ' ').replace(/\s+/g, ' ').trim();
+  }
+
+  function optionLabel(o) {
+    return o.getAttribute('data-automation-label') || o.textContent || '';
+  }
+
+  // Best match for target: exact label, then label starting with target, then label containing it.
+  function pickBestOption(options, target) {
+    const t = normalizeText(target);
+    if (!t) return null;
+    return options.find(o => normalizeText(optionLabel(o)) === t)
+        || options.find(o => normalizeText(optionLabel(o)).startsWith(t))
+        || options.find(o => normalizeText(optionLabel(o)).includes(t))
+        || null;
+  }
+
+  // Search-result options in the open prompt, excluding already-selected pills.
+  function getPromptOptions() {
+    return [...document.querySelectorAll('[data-automation-id="promptOption"]')]
+      .filter(o => !o.closest('[data-automation-id="selectedItemList"]')
+                && !o.closest('[data-automation-id="selectedItem"]'));
+  }
+
+  function hasNoMatches() {
+    return [...document.querySelectorAll('[data-automation-id="promptTitle"]')]
+      .some(el => normalizeText(el.getAttribute('title') || el.textContent) === 'no matches found');
+  }
+
+  // Poll until the prompt shows results or "No matches found", up to timeout ms.
+  async function waitForPromptResults(timeout = 3000) {
+    await wait(600);
+    const start = Date.now();
+    while (Date.now() - start < timeout) {
+      if (hasNoMatches() || getPromptOptions().length) return;
+      await wait(200);
+    }
+  }
+
+  // Find the checkbox that belongs to one prompt option row (not a sibling row's).
+  function getOptionCheckbox(option) {
+    let el = option;
+    for (let i = 0; i < 5 && el; i++) {
+      const cb = el.querySelector('input[type="checkbox"][data-automation-id="checkboxPanel"]');
+      if (cb) return cb;
+      el = el.parentElement;
+      if (!el || el.querySelectorAll('[data-automation-id="promptOption"]').length > 1) break;
+    }
+    return null;
+  }
+
+  // Multiselect search flow (skills, disclosure questions): type, wait for results to load,
+  // then tick the matching option's checkbox. Tries each candidate in order. Returns true if ticked.
+  async function selectMultiselectOption(input, candidates, loadMs = 3000) {
+    candidates = toList(candidates);
+    if (!input || !candidates.length) return false;
+
+    for (const candidate of candidates) {
+      input.focus(); input.click();
+      setInputValue(input, candidate);
+      await wait(loadMs);
+
+      const option = hasNoMatches() ? null : pickBestOption(getPromptOptions(), candidate);
+      if (!option) {
+        setInputValue(input, '');
+        await wait(300);
+        continue;
+      }
+
+      // Tick the option's checkbox; fall back to clicking the option itself.
+      // Workday re-renders the checkbox on change, so re-read it by id before verifying.
+      const label = optionLabel(option);
+      const cb = getOptionCheckbox(option);
+      const isChecked = () => {
+        const current = (cb && cb.id && document.getElementById(cb.id)) || cb;
+        return !!current && (current.getAttribute('aria-checked') === 'true' || current.checked);
+      };
+      if (cb) cb.click(); else option.click();
+      await wait(500);
+      if (cb && !isChecked()) {
+        const fresh = getPromptOptions().find(o => optionLabel(o) === label) || option;
+        fresh.click();
+        await wait(500);
+      }
+      if (cb && !isChecked()) console.warn('[Workday Autofill] Could not tick option:', label);
+      await wait(300);
+      return true;
+    }
+    return false;
+  }
+
   async function addSkill(skillName) {
     const container = document.querySelector('[data-automation-id="formField-skills"]');
-    if (!container) return;
-    let input = container.querySelector('[data-automation-id="multiselectInputContainer"] input') || container.querySelector('input[type="text"]');
+    const input = (container && (container.querySelector('[data-automation-id="searchBox"]')
+                              || container.querySelector('[data-automation-id="multiselectInputContainer"] input')))
+               || document.querySelector('#skills--skills');
     if (!input) return;
-    input.focus(); input.click();
-    setInputValue(input, skillName);
-    await wait(1000);
-    pressEnter(input);
-    await wait(800);
-    pressEnter(input);
-    await wait(800);
+    if (!await selectMultiselectOption(input, skillName)) {
+      console.warn('[Workday Autofill] Skill not found:', skillName);
+    }
   }
 
   function getAddButtonForSection(sectionName) {
@@ -178,6 +281,50 @@
     return null;
   }
 
+  // Set a value the way a user would: focus, type, leave. Workday only validates
+  // and commits some inputs (e.g. date sections) on focus/blur, not on input events.
+  async function commitInputValue(input, value) {
+    if (!input || value === null || value === undefined || value === '') return;
+    input.focus();
+    input.dispatchEvent(new FocusEvent('focusin', { bubbles: true }));
+    input.click();
+    setInputValue(input, String(value));
+    await wait(150);
+    input.blur();
+    input.dispatchEvent(new FocusEvent('focusout', { bubbles: true }));
+    await wait(150);
+  }
+
+  async function fillDate(dateEl, month, year, day) {
+    if (!dateEl) return;
+    await commitInputValue(dateEl.querySelector('[data-automation-id="dateSectionMonth-input"]'), toMonthNum(month));
+    await commitInputValue(dateEl.querySelector('[data-automation-id="dateSectionDay-input"]'), day);
+    await commitInputValue(dateEl.querySelector('[data-automation-id="dateSectionYear-input"]'), year);
+  }
+
+  // Open a listbox button and pick the first candidate that exists. Returns true if picked.
+  async function selectFromListboxButton(btn, candidates) {
+    candidates = toList(candidates);
+    if (!btn || !candidates.length) return false;
+    btn.click();
+    await wait(600);
+    const opts = [...document.querySelectorAll('[role="option"]')];
+    for (const candidate of candidates) {
+      const opt = pickBestOption(opts, candidate);
+      if (opt) { opt.click(); await wait(400); return true; }
+    }
+    document.body.click();
+    await wait(200);
+    return false;
+  }
+
+  // Language entries are identified by their language button: id="language-<n>--language".
+  function getLastLanguageButton() {
+    const btns = [...document.querySelectorAll('button[aria-haspopup="listbox"][name="language"]')]
+      .filter(b => /^language-\d+--language$/.test(b.id));
+    return btns[btns.length - 1] || null;
+  }
+
   async function fillPage1(data) {
     console.log("[Workday Autofill] Filling Page 1");
     setInputValue(document.querySelector('input[name="legalName--firstName"]'), data.firstName);
@@ -185,9 +332,22 @@
     setInputValue(document.querySelector('input[name="addressLine1"]'), data.address);
     setInputValue(document.querySelector('input[name="city"]'), data.city);
     setInputValue(document.querySelector('input[name="postalCode"]'), data.postalCode);
-    setInputValue(document.querySelector('input[name="phoneNumber"]'), data.phone);
     await fillDropdown('formField-countryRegion', data.province);
     await fillDropdown('formField-phoneType', 'Mobile');
+
+    // Phone last: the dropdowns above can re-render the phone section and wipe it.
+    // Workday validates digits only and commits the value on blur.
+    if (data.phone) {
+      const phoneInput = document.querySelector('input[name="phoneNumber"]');
+      if (phoneInput) {
+        phoneInput.focus();
+        phoneInput.click();
+        setInputValue(phoneInput, String(data.phone).replace(/\D/g, ''));
+        await wait(200);
+        phoneInput.blur();
+        await wait(200);
+      }
+    }
     if (data.previousWorker !== undefined) {
       const val = data.previousWorker === true ? "true" : "false";
       const radio = document.querySelector(`input[type="radio"][name="candidateIsPreviousWorker"][value="${val}"]`);
@@ -229,19 +389,9 @@
       const cur = getLastField('formField-currentlyWorkHere');
       if (cur && entry.currentlyWorkHere) { const cb = cur.querySelector('input[type="checkbox"]'); if (cb && !cb.checked) { cb.click(); await wait(200); } }
 
-      const sd = getLastField('formField-startDate');
-      if (sd) {
-        setInputValue(sd.querySelector('[data-automation-id="dateSectionMonth-input"]'), toMonthNum(entry.startMonth));
-        await wait(100);
-        setInputValue(sd.querySelector('[data-automation-id="dateSectionYear-input"]'), entry.startYear);
-      }
+      await fillDate(getLastField('formField-startDate'), entry.startMonth, entry.startYear);
       if (!entry.currentlyWorkHere && entry.endMonth) {
-        const ed = getLastField('formField-endDate');
-        if (ed) {
-          setInputValue(ed.querySelector('[data-automation-id="dateSectionMonth-input"]'), toMonthNum(entry.endMonth));
-          await wait(100);
-          setInputValue(ed.querySelector('[data-automation-id="dateSectionYear-input"]'), entry.endYear);
-        }
+        await fillDate(getLastField('formField-endDate'), entry.endMonth, entry.endYear);
       }
       const desc = getLastField('formField-roleDescription'); if (desc) setTextareaValue(desc.querySelector('textarea'), entry.description);
       await wait(400);
@@ -280,44 +430,44 @@
         }
       }
 
-      // 2. Degree — button-dropdown (aria-haspopup="listbox"). Click button, then pick option.
-      if (entry.degree) {
+      // 2. Degree — button-dropdown (aria-haspopup="listbox"). Try each candidate in order until one exists.
+      const degreeCandidates = toList(entry.degree);
+      if (degreeCandidates.length) {
         const degreeEl = getLastFieldAny(['formField-degree', 'formField-degreeLevel', 'formField-degreeName']);
         if (degreeEl) {
           const degBtn = degreeEl.querySelector('button[aria-haspopup="listbox"]');
           if (degBtn) {
             degBtn.click();
             await wait(700);
-            const opts = document.querySelectorAll('[role="option"], [role="listbox"] li');
-            const target = entry.degree.trim().toLowerCase();
-            let picked = false;
-            for (const o of opts) {
-              if (o.textContent.trim().toLowerCase() === target) { o.click(); picked = true; await wait(400); break; }
+            const opts = [...document.querySelectorAll('[role="option"], [role="listbox"] li')];
+            let picked = null;
+            for (const candidate of degreeCandidates) {
+              picked = pickBestOption(opts, candidate);
+              if (picked) break;
             }
-            if (!picked) {
-              for (const o of opts) {
-                if (o.textContent.trim().toLowerCase().includes(target)) { o.click(); picked = true; await wait(400); break; }
-              }
-            }
-            if (!picked) {
+            if (picked) {
+              picked.click();
+              await wait(400);
+            } else {
               // Close the popup so subsequent fields are reachable.
               document.body.click();
               await wait(200);
-              console.warn('[Workday Autofill] Degree option not found:', entry.degree);
+              console.warn('[Workday Autofill] No degree option found for:', degreeCandidates);
             }
           } else {
             // Fallback: typeahead-style input if the tenant ever uses one.
             const degInput = degreeEl.querySelector('[data-automation-id="searchBox"]') || degreeEl.querySelector('input:not(.css-77hcv)');
             if (degInput) {
-              degInput.focus(); degInput.click(); setInputValue(degInput, entry.degree); await wait(800);
+              degInput.focus(); degInput.click(); setInputValue(degInput, degreeCandidates[0]); await wait(800);
               await pressEnterTwice(degInput); await wait(400);
             }
           }
         }
       }
 
-      // 3. Field of Study — multi-select with placeholder="Search". Type, then click matching option.
-      if (entry.fieldOfStudy) {
+      // 3. Field of Study — multi-select search. Try each candidate; move on when Workday says "No matches found".
+      const fosCandidates = toList(entry.fieldOfStudy);
+      if (fosCandidates.length) {
         const fosEl = getLastFieldAny(['formField-fieldOfStudy', 'formField-major', 'formField-fieldofstudy']);
         if (fosEl) {
           const input = fosEl.querySelector('[data-automation-id="multiselectInputContainer"] input')
@@ -325,24 +475,23 @@
                      || fosEl.querySelector('[data-automation-id="searchBox"]')
                      || fosEl.querySelector('input');
           if (input) {
-            input.focus(); input.click();
-            setInputValue(input, entry.fieldOfStudy);
-            await wait(900);
-            const target = entry.fieldOfStudy.trim().toLowerCase();
-            // Exclude already-selected pills (which also use [data-automation-id="promptOption"]).
-            const results = [...document.querySelectorAll('[role="option"], [data-automation-id="promptOption"]')]
-              .filter(r => !r.closest('[data-automation-id="selectedItemList"]')
-                        && !r.closest('[data-automation-id="selectedItem"]'));
             let picked = false;
-            for (const r of results) {
-              if (r.textContent.trim().toLowerCase() === target) { r.click(); picked = true; await wait(400); break; }
-            }
-            if (!picked) {
-              for (const r of results) {
-                if (r.textContent.toLowerCase().includes(target)) { r.click(); picked = true; await wait(400); break; }
+            for (const candidate of fosCandidates) {
+              input.focus(); input.click();
+              setInputValue(input, candidate);
+              await waitForPromptResults(3000);
+              const option = hasNoMatches() ? null : pickBestOption(getPromptOptions(), candidate);
+              if (option) {
+                option.click();
+                picked = true;
+                await wait(400);
+                break;
               }
+              // Clear the search before trying the next candidate.
+              setInputValue(input, '');
+              await wait(400);
             }
-            if (!picked) { pressEnter(input); await wait(300); }
+            if (!picked) console.warn('[Workday Autofill] No field of study found for:', fosCandidates);
             input.blur();
             await wait(300);
           }
@@ -394,11 +543,42 @@
       }
       if (entry.number) { const n = getLastField('formField-certificationNumber'); if (n) setInputValue(n.querySelector('input'), entry.number); }
       if (entry.expiryMonth) {
-        const exp = getLastField('formField-expirationDate');
-        if (exp) {
-          setInputValue(exp.querySelector('[data-automation-id="dateSectionMonth-input"]'), toMonthNum(entry.expiryMonth)); await wait(100);
-          if (entry.expiryDay)  setInputValue(exp.querySelector('[data-automation-id="dateSectionDay-input"]'),  entry.expiryDay);
-          if (entry.expiryYear) setInputValue(exp.querySelector('[data-automation-id="dateSectionYear-input"]'), entry.expiryYear);
+        await fillDate(getLastField('formField-expirationDate'), entry.expiryMonth, entry.expiryYear, entry.expiryDay);
+      }
+      await wait(300);
+    }
+
+    // Languages — reuse an empty entry if the section starts with one, otherwise click Add.
+    for (let i = 0; i < (data.languages || []).length; i++) {
+      const entry = data.languages[i];
+      if (!entry.language) continue;
+      let langBtn = getLastLanguageButton();
+      if (!langBtn || normalizeText(langBtn.textContent) !== 'select one') {
+        const addBtn = getAddButtonForSection('Languages');
+        if (!addBtn) { console.warn(`[Workday Autofill] No Languages Add button for entry ${i}`); continue; }
+        addBtn.click(); await wait(900);
+        langBtn = getLastLanguageButton();
+      }
+      if (!langBtn) { console.warn('[Workday Autofill] Language entry not found after Add'); continue; }
+
+      if (!await selectFromListboxButton(langBtn, entry.language)) {
+        console.warn('[Workday Autofill] Language option not found:', entry.language);
+      }
+
+      // Proficiency buttons share the entry's id prefix; aria-label starts with the type, e.g. "Reading Fluent Required".
+      // proficiency may be a value/list for all types, or an object keyed by type with an optional "default".
+      const prefix = langBtn.id.split('--')[0];
+      const profIds = [...document.querySelectorAll(`button[aria-haspopup="listbox"][id^="${prefix}--"]`)]
+        .map(b => b.id)
+        .filter(id => id !== langBtn.id);
+      for (const id of profIds) {
+        const btn = document.getElementById(id);
+        if (!btn) continue;
+        const type = (btn.getAttribute('aria-label') || '').split(' ')[0];
+        const p = entry.proficiency;
+        const wanted = (p && typeof p === 'object' && !Array.isArray(p)) ? (p[type] || p.default) : p;
+        if (!await selectFromListboxButton(btn, wanted)) {
+          console.warn(`[Workday Autofill] ${type} proficiency option not found:`, wanted);
         }
       }
       await wait(300);
@@ -475,11 +655,62 @@
     }
   }
 
-  const filled = { page1: false, page2: false, page3: false };
+  // Question text for a field: its formField automation id plus its label/legend text.
+  function getQuestionText(input) {
+    const field = input.closest('[data-automation-id^="formField-"]');
+    const fieldset = input.closest('fieldset');
+    const parts = [
+      field && field.getAttribute('data-automation-id'),
+      field && field.querySelector('label, legend') && field.querySelector('label, legend').textContent,
+      fieldset && fieldset.querySelector('legend') && fieldset.querySelector('legend').textContent,
+      input.id && document.querySelector(`label[for="${CSS.escape(input.id)}"]`)?.textContent
+    ];
+    return normalizeText(parts.filter(Boolean).join(' '));
+  }
+
+  function getSelectedLabels(scope) {
+    if (!scope) return [];
+    return [...scope.querySelectorAll('[data-automation-id="selectedItem"] [data-automation-id="promptOption"]')]
+      .map(o => normalizeText(optionLabel(o)));
+  }
+
+  async function fillDisclosures(data) {
+    console.log("[Workday Autofill] Filling Voluntary Disclosures");
+    const vd = data.voluntaryDisclosures || {};
+
+    // Sex and race/ethnicity are single-select button dropdowns.
+    const dropdowns = [['gender', vd.sex], ['ethnicity', vd.ethnicity]];
+    for (const [name, wanted] of dropdowns) {
+      if (!toList(wanted).length) continue;
+      const btn = document.querySelector(`button[aria-haspopup="listbox"][name="${name}"]`);
+      if (!btn) continue;
+      if (toList(wanted).some(w => normalizeText(btn.textContent).startsWith(normalizeText(w)))) continue;
+      if (!await selectFromListboxButton(btn, wanted)) console.warn(`[Workday Autofill] ${name} option not found:`, wanted);
+    }
+
+    // Everything else is a multiselect with checkboxes, matched to an answer by keywords in the question text.
+    const questions = vd.questions || [];
+    for (const input of document.querySelectorAll('[data-automation-id="searchBox"]')) {
+      const text = getQuestionText(input);
+      const q = questions.find(q => toList(q.match).some(k => text.includes(normalizeText(k))));
+      if (!q) continue;
+      const field = input.closest('[data-automation-id^="formField-"]') || input.closest('fieldset');
+      const selected = getSelectedLabels(field);
+      if (toList(q.answer).some(a => selected.includes(normalizeText(a)))) continue;
+      if (!await selectMultiselectOption(input, q.answer)) {
+        console.warn('[Workday Autofill] Disclosure answer not found:', q.answer, 'for', text);
+      }
+      input.blur();
+      await wait(300);
+    }
+  }
+
+  const filled = { page1: false, page2: false, page3: false, disclosures: false };
   async function checkAndFill() {
     if (!filled.page1 && document.querySelector('[data-automation-id="applyFlowMyInfoPage"]'))   { filled.page1 = true; await wait(600); await fillPage1(data); }
     if (!filled.page2 && document.querySelector('[data-automation-id="applyFlowMyExpPage"]'))    { filled.page2 = true; await wait(600); await fillPage2(data); }
     if (!filled.page3 && document.querySelector('[data-automation-id="applyFlowPrimaryQuestionsPage"]')) { filled.page3 = true; await wait(600); await fillPage3(data); }
+    if (!filled.disclosures && document.querySelector('[data-automation-id="applyFlowVoluntaryDisclosuresPage"]')) { filled.disclosures = true; await wait(600); await fillDisclosures(data); }
   }
 
   const observer = new MutationObserver(() => checkAndFill());

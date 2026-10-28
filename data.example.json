@@ -53,11 +53,26 @@
     }
   ],
 
+  "languages": [
+    {
+      "language": "English",
+      "proficiency": ["Fluent", "Advanced"]
+    }
+  ],
+
   "skills": [
     "JavaScript",
     "HTML",
     "CSS"
   ],
+
+  "voluntaryDisclosures": {
+    "sex": "",
+    "ethnicity": "",
+    "questions": [
+      { "match": ["keyword from the question text"], "answer": "Exact option label" }
+    ]
+  },
 
   "applicationQuestions": {
     "ageRequirement": "Yes",
